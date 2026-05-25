@@ -1,0 +1,10 @@
+# build/runtime artifacts
+dist/
+bridge/.venv/
+__pycache__/
+*.pyc
+
+# editor cruft
+.vscode/
+.idea/
+*.swp
