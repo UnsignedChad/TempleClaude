@@ -44,21 +44,26 @@ TempleOS prints to the current window the same way Claude generated it.
 
 ## Setup
 
-You need: `qemu-system-x86_64`, `xorriso`, `python3 >= 3.10`, `curl`.
+You need: VirtualBox 7.x, `xorriso`, `python3 >= 3.10`, `curl`.
+(QEMU works in theory but its SeaBIOS chokes on Terry's RedSea ISO El
+Torito record. VBox is Terry's own dev target so it Just Works.)
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-./run.sh setup       # fetch TempleOS.ISO (SHA-1 verified), build payload, create disk
-./run.sh install     # interactive: hit y at seed, run SysIns, install to C:
-./run.sh run         # boot installed HDD + payload ISO + bridge
+./run.sh setup       # fetch TempleOS.ISO, build payload, create VM + disk
+./run.sh run         # start bridge + boot VM (GUI). First boot: hit y at
+                     # the seed prompt, run SysIns to install onto C:, then
+                     # shutdown TempleOS (Shutdown; from the prompt).
+./run.sh flip        # detach the install ISO so we boot from disk going forward
+./run.sh run         # subsequent boots
 ```
 
-The TempleOS ISO is downloaded from `www.templeos.org/Downloads/TempleOS.ISO`.
-SHA-1 is checked against the value pinned in `run.sh`. Override via
-`TEMPLE_ISO_URL` or `TEMPLE_ISO_SHA1` if you need a different source.
+The TempleOS ISO is fetched from `www.templeos.org/Downloads/TempleOS.ISO`
+and SHA-1-verified against the value pinned in `run.sh`. Override via
+`TEMPLE_ISO_URL` / `TEMPLE_ISO_SHA1` if you need a different source.
 
-If you don't want to install, `./run.sh live` boots the read-only ISO with
-the payload attached as a second CD-ROM.
+Other subcommands: `payload` (rebuild T: ISO), `bridge` (just the host
+daemon), `headless` (no GUI), `poweroff`, `destroy`.
 
 ## Talking to Claude
 

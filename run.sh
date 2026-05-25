@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# run.sh -- launch TempleOS + Claude bridge.
+# run.sh -- TempleClaude on VirtualBox.
 #
 # Subcommands:
-#   ./run.sh setup      one-time: fetch TempleOS ISO, build payload ISO, install
+#   ./run.sh setup      fetch TempleOS ISO, build payload, create disk + VM
 #   ./run.sh payload    rebuild only the Claude payload ISO
 #   ./run.sh bridge     start just the host bridge (foreground)
-#   ./run.sh run        boot installed HDD + payload ISO + bridge (default)
-#   ./run.sh live       boot the live ISO (no install) + payload + bridge
+#   ./run.sh run        start bridge, launch the VM (GUI)
+#   ./run.sh headless   start bridge, launch the VM headless
+#   ./run.sh poweroff   force-stop the VM
+#   ./run.sh destroy    unregister + delete the VM and disk
+#
+# Why VirtualBox: Terry developed TempleOS on VBox, so this is the
+# best-tested path. QEMU works too but its SeaBIOS sometimes chokes
+# on the El Torito record on Terry's RedSea ISOs.
 
 set -euo pipefail
 
@@ -14,12 +20,12 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 DIST="$ROOT/dist"
 TEMPLE_ISO="$DIST/TempleOS.ISO"
 PAYLOAD_ISO="$DIST/claude_payload.iso"
-HDD="$DIST/templeos.qcow2"
+HDD="$DIST/templeos.vdi"
 SOCK="/tmp/templeclaude.sock"
 PIDFILE="$DIST/bridge.pid"
 
-# Source of truth for the official TempleOS distro. SHA-1 is from
-# Terry's last published nightly. If this mirror dies, swap the URL.
+VM_NAME="${TEMPLECLAUDE_VM:-TempleClaude}"
+
 TEMPLE_ISO_URL="${TEMPLE_ISO_URL:-https://www.templeos.org/Downloads/TempleOS.ISO}"
 TEMPLE_ISO_SHA1="${TEMPLE_ISO_SHA1:-411287597741d045a1860d25a15aaad2a7fc2151}"
 
@@ -48,16 +54,49 @@ build_payload() {
   mkdir -p "$stage/Apps/Claude"
   cp "$ROOT/Apps/Claude/Claude.HC" "$stage/Apps/Claude/"
   cp "$ROOT/Apps/Claude/Load.HC"   "$stage/Apps/Claude/"
-  # ISO9660 with Joliet so TempleOS sees normal filenames on the T: drive.
   xorriso -as mkisofs -V CLAUDE -J -r -o "$PAYLOAD_ISO" "$stage" 2>&1 | tail -3
   rm -rf "$stage"
   echo "[payload] wrote $PAYLOAD_ISO"
 }
 
-ensure_hdd() {
+vm_exists() { VBoxManage showvminfo "$VM_NAME" >/dev/null 2>&1; }
+
+create_vm() {
+  if vm_exists; then
+    echo "[setup] VM '$VM_NAME' already exists -- skipping create"
+    return
+  fi
   if [[ ! -f "$HDD" ]]; then
-    echo "[setup] creating blank 512MB qcow2 at $HDD"
-    qemu-img create -f qcow2 "$HDD" 512M
+    VBoxManage createmedium disk --filename "$HDD" --size 512 --format VDI
+  fi
+  # ostype "Other_64" -- TempleOS is 64-bit but not on the supported list.
+  VBoxManage createvm --name "$VM_NAME" --ostype Other_64 --register --basefolder "$DIST"
+  VBoxManage modifyvm "$VM_NAME" \
+    --memory 512 --cpus 2 --vram 16 \
+    --boot1 dvd --boot2 disk --boot3 none --boot4 none \
+    --audio-driver none --usb-ohci off --usb-ehci off --usb-xhci off \
+    --rtcuseutc on --acpi on
+  # IDE controller -- TempleOS does not speak AHCI/SATA.
+  VBoxManage storagectl "$VM_NAME" --name "IDE" --add ide --controller PIIX4
+  VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
+    --port 0 --device 0 --type hdd --medium "$HDD"
+  VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
+    --port 0 --device 1 --type dvddrive --medium "$TEMPLE_ISO"
+  VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
+    --port 1 --device 0 --type dvddrive --medium "$PAYLOAD_ISO"
+  # COM1 -> host pipe (client mode: bridge binds the socket first).
+  VBoxManage modifyvm "$VM_NAME" --uart1 0x3F8 4
+  VBoxManage modifyvm "$VM_NAME" --uartmode1 client "$SOCK"
+  echo "[setup] VM created"
+}
+
+# Detach the install ISO once you've SysIns'd onto the HDD. After this,
+# the VM boots from disk and the payload stays in the second DVD slot.
+flip_to_hdd_boot() {
+  if vm_exists; then
+    VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
+      --port 0 --device 1 --type dvddrive --medium emptydrive 2>/dev/null || true
+    VBoxManage modifyvm "$VM_NAME" --boot1 disk --boot2 dvd --boot3 none --boot4 none
   fi
 }
 
@@ -70,9 +109,9 @@ start_bridge() {
     python3 -m venv "$ROOT/bridge/.venv"
     "$ROOT/bridge/.venv/bin/pip" install -q -r "$ROOT/bridge/requirements.txt"
   fi
+  rm -f "$SOCK"
   TEMPLECLAUDE_SOCK="$SOCK" "$ROOT/bridge/.venv/bin/python" "$ROOT/bridge/claude_bridge.py" &
   echo $! > "$PIDFILE"
-  # Give the server a moment to bind before QEMU tries to connect.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     [[ -S "$SOCK" ]] && return 0
     sleep 0.2
@@ -89,41 +128,28 @@ stop_bridge() {
 }
 trap stop_bridge EXIT
 
-qemu_common=(
-  qemu-system-x86_64
-  -m 512
-  -cpu qemu64
-  -smp 2
-  # COM1 -> bridge unix socket. server=off means QEMU connects as client;
-  # the bridge bound the socket first, so this works without races.
-  -chardev "socket,id=ser0,path=$SOCK,server=off"
-  -serial chardev:ser0
-  -display gtk
-  -name "TempleClaude"
-)
-
 cmd="${1:-run}"
 case "$cmd" in
   setup)
     fetch_iso
     build_payload
-    ensure_hdd
+    create_vm
     echo
-    echo "[setup] now run:  ./run.sh install"
-    echo "[setup] then in TempleOS, hit y to accept the seed, then run SysIns;"
-    echo "[setup] follow prompts to install to C: (the qcow2). Shutdown when done."
-    ;;
-  install)
-    fetch_iso
-    ensure_hdd
-    qemu-system-x86_64 \
-      -m 512 -cpu qemu64 -smp 2 \
-      -drive "file=$TEMPLE_ISO,media=cdrom" \
-      -drive "file=$HDD,format=qcow2,index=0,media=disk" \
-      -boot d -display gtk -name "TempleClaude install"
+    echo "[setup] done. Next: ./run.sh run"
+    echo "[setup] In TempleOS: hit y to accept seed, run SysIns to install"
+    echo "[setup] to C:, shut down, then ./run.sh flip and ./run.sh run."
     ;;
   payload)
     build_payload
+    if vm_exists; then
+      # Re-attach so VBox picks up the new ISO content.
+      VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
+        --port 1 --device 0 --type dvddrive --medium "$PAYLOAD_ISO"
+    fi
+    ;;
+  flip)
+    flip_to_hdd_boot
+    echo "[flip] VM now boots from disk; payload ISO still attached as DVD."
     ;;
   bridge)
     rm -f "$SOCK"
@@ -132,31 +158,34 @@ case "$cmd" in
     fi
     TEMPLECLAUDE_SOCK="$SOCK" exec "$ROOT/bridge/.venv/bin/python" "$ROOT/bridge/claude_bridge.py"
     ;;
-  live)
-    fetch_iso
-    build_payload
-    rm -f "$SOCK"
-    start_bridge
-    "${qemu_common[@]}" \
-      -drive "file=$TEMPLE_ISO,media=cdrom,index=0" \
-      -drive "file=$PAYLOAD_ISO,media=cdrom,index=2" \
-      -boot d
-    ;;
   run)
-    if [[ ! -f "$HDD" ]]; then
-      echo "no $HDD -- run './run.sh setup' then './run.sh install' first" >&2
-      exit 1
-    fi
-    build_payload
-    rm -f "$SOCK"
+    vm_exists || { echo "no VM -- run './run.sh setup' first" >&2; exit 1; }
     start_bridge
-    "${qemu_common[@]}" \
-      -drive "file=$HDD,format=qcow2,index=0,media=disk" \
-      -drive "file=$PAYLOAD_ISO,media=cdrom,index=2" \
-      -boot c
+    VBoxManage startvm "$VM_NAME" --type gui
+    # Bridge keeps running until the VM exits + trap fires.
+    echo "[run] VM started. Ctrl-C here to stop the bridge."
+    wait
+    ;;
+  headless)
+    vm_exists || { echo "no VM -- run './run.sh setup' first" >&2; exit 1; }
+    start_bridge
+    VBoxManage startvm "$VM_NAME" --type headless
+    echo "[headless] VM started. Console on VRDE if you enabled it."
+    wait
+    ;;
+  poweroff)
+    VBoxManage controlvm "$VM_NAME" poweroff 2>/dev/null || true
+    ;;
+  destroy)
+    VBoxManage controlvm "$VM_NAME" poweroff 2>/dev/null || true
+    sleep 1
+    VBoxManage unregistervm "$VM_NAME" --delete 2>/dev/null || true
+    rm -rf "$DIST/$VM_NAME"
+    rm -f "$HDD"
+    echo "[destroy] gone"
     ;;
   *)
-    echo "usage: $0 {setup|install|payload|bridge|live|run}" >&2
+    echo "usage: $0 {setup|payload|flip|bridge|run|headless|poweroff|destroy}" >&2
     exit 1
     ;;
 esac
