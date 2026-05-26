@@ -22,7 +22,7 @@
   emulates a 16550 at 0x3F8, which is what we need.
 */
 
-#include "::/Doc/Comm.HC"
+#include "::/Doc/Comm"
 
 #define CLAUDE_COM_PORT  1
 #define CLAUDE_BAUD      115200

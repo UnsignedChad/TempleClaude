@@ -50,13 +50,19 @@ Torito record. VBox is Terry's own dev target so it Just Works.)
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-./run.sh setup       # fetch TempleOS.ISO, build payload, create VM + disk
-./run.sh run         # start bridge + boot VM (GUI). First boot: hit y at
-                     # the seed prompt, run SysIns to install onto C:, then
-                     # shutdown TempleOS (Shutdown; from the prompt).
-./run.sh flip        # detach the install ISO so we boot from disk going forward
-./run.sh run         # subsequent boots
+./run.sh setup       # fetch TempleOS.ISO, create VM + blank disk
+./run.sh run         # boot the live ISO. Hit y at the seed prompt, run
+                     # SysIns onto a partition (it ends up at C: or D:),
+                     # then Shutdown; from the HolyC prompt.
+./run.sh flip        # detach install ISO so subsequent boots use the disk
+./run.sh inject      # copy Claude.HC + auto-load Once.HC into /Home on
+                     # the installed VDI (needs sudo for qemu-nbd)
+./run.sh run         # done. boot, see banner, type ClaudeAsk;
 ```
+
+After the one-time `inject`, every boot auto-loads the Claude client.
+You'll see a green "TempleClaude ready" banner and just need to type
+`ClaudeAsk;` (or `ClaudeOracle;`).
 
 The TempleOS ISO is fetched from `www.templeos.org/Downloads/TempleOS.ISO`
 and SHA-1-verified against the value pinned in `run.sh`. Override via

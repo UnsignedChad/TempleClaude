@@ -2,11 +2,10 @@
 """
 claude_bridge.py -- the divine intermediary.
 
-Speaks the binary framing protocol that Apps/Claude/Claude.HC speaks,
-on one side, and the Anthropic Messages API on the other. QEMU pipes
-TempleOS's emulated COM1 into a Unix socket we listen on; we read
-ASK frames off it, hit the API in streaming mode, and ship TOK
-chunks back as they arrive, terminated by an END frame.
+Speaks the binary framing protocol that /Home/Claude.HC speaks on one side,
+and the Anthropic Messages API on the other. VBox creates a Unix domain
+socket as its COM1 backend (UART server mode); we connect to it as a
+client and read/write frames.
 
 Frame layout (must match Claude.HC):
   [1 byte type] [4 bytes length, LE] [payload]
@@ -18,15 +17,17 @@ Types:
   0x04 ERR   error string (out)
   0x05 PNG   liveness, empty (either)
 
-ANTHROPIC_API_KEY must be set in the env. Default model is
-claude-opus-4-7 -- override with CLAUDE_MODEL.
+ANTHROPIC_API_KEY must be set. Default model is claude-opus-4-7;
+override with CLAUDE_MODEL.
+
+Reconnect loop: if VBox is down or the VM is rebooting, we keep retrying
+the socket every second. The VM can come and go without restarting us.
 """
 
 import asyncio
 import os
 import struct
 import sys
-import json
 from pathlib import Path
 
 try:
@@ -40,8 +41,6 @@ SOCK_PATH = os.environ.get("TEMPLECLAUDE_SOCK", "/tmp/templeclaude.sock")
 MODEL     = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
 MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "1024"))
 
-# System prompt is tuned for TempleOS's 80-col 16-color text grid.
-# Short lines, no markdown, no code fences, no em-dashes.
 SYSTEM_PROMPT = (
     "You are speaking through the COM1 serial port of TempleOS, "
     "Terry Davis's 16-color 640x480 operating system, to a user "
@@ -77,7 +76,6 @@ async def write_frame(writer, ftype, payload=b""):
 
 
 async def stream_claude(client, prompt, writer):
-    """Hit the Anthropic API in streaming mode, push TOK frames as text arrives."""
     try:
         async with client.messages.stream(
             model=MODEL,
@@ -88,9 +86,6 @@ async def stream_claude(client, prompt, writer):
             async for chunk in stream.text_stream:
                 if not chunk:
                     continue
-                # ASCII-only -- TempleOS's font is a custom 8x8 bitmap that
-                # only covers code points 0-255. Strip anything that won't
-                # render rather than ship mojibake.
                 data = chunk.encode("ascii", "replace")
                 await write_frame(writer, FRAME_TOK, data)
         await write_frame(writer, FRAME_END)
@@ -104,30 +99,18 @@ async def stream_claude(client, prompt, writer):
         await write_frame(writer, FRAME_ERR, msg.encode("ascii", "replace")[:512])
 
 
-async def handle_client(reader, writer, client):
-    peer = writer.get_extra_info("peername") or writer.get_extra_info("sockname")
-    log(f"templeos connected ({peer})")
-    try:
-        while True:
-            ftype, payload = await read_frame(reader)
-            if ftype == FRAME_ASK:
-                prompt = payload.decode("utf-8", "replace")
-                log(f"ASK [{len(prompt)} chars]: {prompt[:80]!r}")
-                await stream_claude(client, prompt, writer)
-            elif ftype == FRAME_PNG:
-                await write_frame(writer, FRAME_PNG)
-            else:
-                log(f"unknown frame type {ftype:#x}, ignoring")
-    except asyncio.IncompleteReadError:
-        log("templeos disconnected")
-    except Exception as e:
-        log(f"handler error: {type(e).__name__}: {e}")
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
+async def serve_once(client, reader, writer):
+    """Handle frames over one socket connection until peer closes."""
+    while True:
+        ftype, payload = await read_frame(reader)
+        if ftype == FRAME_ASK:
+            prompt = payload.decode("utf-8", "replace")
+            log(f"ASK [{len(prompt)} chars]: {prompt[:80]!r}")
+            await stream_claude(client, prompt, writer)
+        elif ftype == FRAME_PNG:
+            await write_frame(writer, FRAME_PNG)
+        else:
+            log(f"unknown frame type {ftype:#x}, ignoring")
 
 
 async def main():
@@ -136,22 +119,33 @@ async def main():
         sys.stderr.write("ANTHROPIC_API_KEY not set\n")
         sys.exit(2)
 
-    # Clean up stale socket if a previous run left one.
-    sock = Path(SOCK_PATH)
-    if sock.exists():
-        sock.unlink()
-
     client = anthropic.AsyncAnthropic(api_key=api_key)
+    log(f"target={SOCK_PATH} model={MODEL}")
 
-    server = await asyncio.start_unix_server(
-        lambda r, w: handle_client(r, w, client),
-        path=str(sock),
-    )
-    os.chmod(sock, 0o666)
-    log(f"listening on {sock} | model={MODEL}")
-
-    async with server:
-        await server.serve_forever()
+    while True:
+        if not Path(SOCK_PATH).exists():
+            # VM isn't running yet -- VBox creates the socket at VM start.
+            await asyncio.sleep(1)
+            continue
+        try:
+            reader, writer = await asyncio.open_unix_connection(SOCK_PATH)
+        except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+            await asyncio.sleep(1)
+            continue
+        log("connected to VM")
+        try:
+            await serve_once(client, reader, writer)
+        except asyncio.IncompleteReadError:
+            log("VM closed connection")
+        except Exception as e:
+            log(f"session error: {type(e).__name__}: {e}")
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        # back to top of loop, retry connect
 
 
 if __name__ == "__main__":

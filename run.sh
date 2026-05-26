@@ -59,6 +59,38 @@ build_payload() {
   echo "[payload] wrote $PAYLOAD_ISO"
 }
 
+
+# Inject Claude.HC and a custom Once.HC into /Home on the installed disk,
+# so every boot auto-loads the module and prints a ready banner. Requires
+# the VM to be powered off and nbd kernel module available.
+inject_into_vdi() {
+  if [[ ! -f "$HDD" ]]; then
+    echo "[inject] no $HDD -- install first (./run.sh setup, boot, SysIns)" >&2
+    return 1
+  fi
+  if VBoxManage list runningvms | grep -q "$VM_NAME"; then
+    echo "[inject] VM is running -- power it off first (./run.sh poweroff)" >&2
+    return 1
+  fi
+  local target_part="${TEMPLECLAUDE_INSTALL_PART:-2}"
+  local mnt=/tmp/tc-d
+  echo "[inject] mounting partition $target_part of $HDD"
+  sudo modprobe nbd max_part=8
+  sudo qemu-nbd --connect=/dev/nbd0 "$HDD"
+  sleep 1
+  sudo mkdir -p "$mnt"
+  sudo mount -o uid=$(id -u),gid=$(id -g) "/dev/nbd0p${target_part}" "$mnt"
+  mkdir -p "$mnt/Home"
+  cp "$ROOT/Apps/Claude/Claude.HC"     "$mnt/Home/Claude.HC"
+  cp "$ROOT/host/inject/Once.HC"       "$mnt/Home/Once.HC"
+  # Remove the compressed default if present so our plain version wins.
+  rm -f "$mnt/Home/Once.HC.Z"
+  sync
+  sudo umount "$mnt"
+  sudo qemu-nbd --disconnect /dev/nbd0
+  echo "[inject] /Home/Claude.HC and /Home/Once.HC are in place"
+}
+
 vm_exists() { VBoxManage showvminfo "$VM_NAME" >/dev/null 2>&1; }
 
 create_vm() {
@@ -80,13 +112,14 @@ create_vm() {
   VBoxManage storagectl "$VM_NAME" --name "IDE" --add ide --controller PIIX4
   VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
     --port 0 --device 0 --type hdd --medium "$HDD"
+  # Install ISO sits in the second slot until install completes; ./run.sh
+  # flip detaches it. After flip we never need a DVD again -- inject puts
+  # everything we need into the VDI directly.
   VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
     --port 0 --device 1 --type dvddrive --medium "$TEMPLE_ISO"
-  VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
-    --port 1 --device 0 --type dvddrive --medium "$PAYLOAD_ISO"
-  # COM1 -> host pipe (client mode: bridge binds the socket first).
+  # COM1 -> host pipe (server mode: VBox owns the socket; bridge connects).
   VBoxManage modifyvm "$VM_NAME" --uart1 0x3F8 4
-  VBoxManage modifyvm "$VM_NAME" --uartmode1 client "$SOCK"
+  VBoxManage modifyvm "$VM_NAME" --uartmode1 server "$SOCK"
   echo "[setup] VM created"
 }
 
@@ -109,15 +142,8 @@ start_bridge() {
     python3 -m venv "$ROOT/bridge/.venv"
     "$ROOT/bridge/.venv/bin/pip" install -q -r "$ROOT/bridge/requirements.txt"
   fi
-  rm -f "$SOCK"
   TEMPLECLAUDE_SOCK="$SOCK" "$ROOT/bridge/.venv/bin/python" "$ROOT/bridge/claude_bridge.py" &
   echo $! > "$PIDFILE"
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [[ -S "$SOCK" ]] && return 0
-    sleep 0.2
-  done
-  echo "bridge failed to bind $SOCK" >&2
-  return 1
 }
 
 stop_bridge() {
@@ -139,20 +165,19 @@ case "$cmd" in
     echo "[setup] In TempleOS: hit y to accept seed, run SysIns to install"
     echo "[setup] to C:, shut down, then ./run.sh flip and ./run.sh run."
     ;;
+  inject)
+    inject_into_vdi
+    ;;
   payload)
+    # Payload ISO is no longer attached to the VM (inject puts files
+    # directly on the VDI), but the target is kept for back-compat.
     build_payload
-    if vm_exists; then
-      # Re-attach so VBox picks up the new ISO content.
-      VBoxManage storageattach "$VM_NAME" --storagectl "IDE" \
-        --port 1 --device 0 --type dvddrive --medium "$PAYLOAD_ISO"
-    fi
     ;;
   flip)
     flip_to_hdd_boot
-    echo "[flip] VM now boots from disk; payload ISO still attached as DVD."
+    echo "[flip] install ISO detached; VM now boots from disk."
     ;;
   bridge)
-    rm -f "$SOCK"
     if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
       echo "set ANTHROPIC_API_KEY" >&2; exit 1
     fi
@@ -185,7 +210,7 @@ case "$cmd" in
     echo "[destroy] gone"
     ;;
   *)
-    echo "usage: $0 {setup|payload|flip|bridge|run|headless|poweroff|destroy}" >&2
+    echo "usage: $0 {setup|inject|payload|flip|bridge|run|headless|poweroff|destroy}" >&2
     exit 1
     ;;
 esac
